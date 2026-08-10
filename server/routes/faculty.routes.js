@@ -1,0 +1,1366 @@
+import express from "express";
+const router = express.Router();
+import Classroom from "../models/classroom.js";
+import User from "../models/user.js";
+import authMiddleware from "../middleware/auth.middleware.js";
+import Assignment from "../models/assignment.js";
+import path from "path"
+import fs from "fs"
+import nodemailer from "nodemailer";
+import { sendInviteEmail, notifyNewAssignment, notifyGradePosted} from "../utils/emailService.js";
+import multer from "multer";
+import PDFParser from "pdf2json";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Initialize Gemini AI with 2.5 Pro optimized for speed
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({
+  model: "gemini-2.5-flash", 
+  generationConfig: {
+    temperature: 0, 
+    topK: 1, 
+    topP: 0.1, 
+    maxOutputTokens: 1024,
+    candidateCount: 1, 
+  },
+  safetySettings: [
+    {
+      category: "HARM_CATEGORY_HARASSMENT",
+      threshold: "BLOCK_NONE",
+    },
+    {
+      category: "HARM_CATEGORY_HATE_SPEECH",
+      threshold: "BLOCK_NONE",
+    },
+    {
+      category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+      threshold: "BLOCK_NONE",
+    },
+    {
+      category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+      threshold: "BLOCK_NONE",
+    },
+  ],
+});
+
+const result = await model.generateContent("Hello");
+console.log(result.response.text());
+
+// Create a timeout wrapper for API calls with aggressive timeouts for speed
+const withTimeout = (promise, timeoutMs = 15000) => {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Request timeout")), timeoutMs)
+    ),
+  ]);
+};
+
+const idealAnswersCache = new Map();
+
+const extractPDFText = async (filePath, maxLength = 3000) => {
+  try {
+    const pdfParser = new PDFParser(null, 1);
+    const pdfText = await new Promise((resolve, reject) => {
+      pdfParser.on("pdfParser_dataReady", (pdfData) => {
+        let text = "";
+        for (let page of pdfData.Pages) {
+          for (let textItem of page.Texts) {
+            // Handle each text element properly
+            if (textItem.R && textItem.R.length > 0) {
+              text +=
+                textItem.R.map((r) => decodeURIComponent(r.T)).join("") + " ";
+            }
+            // Stop processing if we've reached the max length for faster processing
+            if (text.length > maxLength) break;
+          }
+          text += "\n"; // Add newline between pages
+          if (text.length > maxLength) break;
+        }
+        // Trim to max length if needed
+        resolve(text.substring(0, maxLength).trim());
+      });
+      pdfParser.on("pdfParser_dataError", reject);
+      pdfParser.loadPDF(filePath);
+    });
+    return pdfText;
+  } catch (error) {
+    console.error("PDF extraction error:", error);
+    throw error;
+  }
+};
+
+// Get faculty's classrooms
+router.get("/classrooms", authMiddleware("Faculty"), async (req, res) => {
+  try {
+    const facultyId = req.user._id;
+
+    const classrooms = await Classroom.find({ faculty: facultyId })
+      .populate("students", "name email")
+      .populate("faculty", "name email");
+
+    res.json({
+      success: true,
+      classrooms,
+    });
+  } catch (error) {
+    console.error("Error fetching faculty classrooms:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch classrooms",
+    });
+  }
+});
+
+// Create new classroom
+router.post("/classrooms", authMiddleware("Faculty"), async (req, res) => {
+  try {
+    const { name, subject, description, studentEmails } = req.body;
+    const facultyId = req.user._id;
+    const faculty = await User.findById(facultyId);
+
+    // Generate a unique room code
+    const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    const newClassroom = new Classroom({
+      name,
+      subject,
+      description,
+      faculty: facultyId,
+      roomCode,
+    });
+
+    await newClassroom.save();
+
+    // Send invitation emails to students
+    if (studentEmails && studentEmails.length > 0) {
+      const emailPromises = studentEmails.map((email) =>
+        sendInviteEmail(email, roomCode, faculty.name, name)
+      );
+
+      try {
+        await Promise.all(emailPromises);
+      } catch (emailError) {
+        console.error("Error sending some invitation emails:", emailError);
+        // Continue execution even if some emails fail
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Classroom created successfully",
+      classroom: newClassroom,
+    });
+  } catch (error) {
+    console.error("Error creating classroom:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create classroom",
+    });
+  }
+});
+
+// Update classroom
+router.put(
+  "/classrooms/:classroomId",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { classroomId } = req.params;
+      const { name, subject, description, studentEmails } = req.body;
+      const facultyId = req.user._id;
+      const faculty = await User.findById(facultyId);
+
+      const classroom = await Classroom.findOne({
+        _id: classroomId,
+        faculty: facultyId,
+      });
+
+      if (!classroom) {
+        return res.status(404).json({
+          success: false,
+          message: "Classroom not found or unauthorized",
+        });
+      }
+
+      // Update classroom details
+      classroom.name = name || classroom.name;
+      classroom.subject = subject || classroom.subject;
+      classroom.description = description || classroom.description;
+c  
+      // Normalize incoming email list from either array or comma-separated string.
+      const normalizedEmails = Array.isArray(studentEmails)
+        ? studentEmails
+        : typeof studentEmails === "string"
+        ? studentEmails.split(",")
+        : [];
+
+      const requestedEmails = [
+        ...new Set(
+          normalizedEmails
+            .map((email) => String(email || "").trim().toLowerCase())
+            .filter(Boolean)
+        ),
+      ];
+
+      // Track already enrolled and previously invited addresses.
+      const populatedClassroom = await Classroom.findById(classroom._id).populate(
+        "students",
+        "email"
+      );
+      const enrolledEmails = new Set(
+        (populatedClassroom?.students || [])
+          .map((student) => String(student.email || "").trim().toLowerCase())
+          .filter(Boolean)
+      );
+      const existingInvites = new Set(
+        (classroom.invitedEmails || [])
+          .map((invite) => String(invite.email || "").trim().toLowerCase())
+          .filter(Boolean)
+      );
+
+      const emailsToInvite = requestedEmails.filter(
+        (email) => !enrolledEmails.has(email) && !existingInvites.has(email)
+      );
+
+      // Persist invited emails so students can join with invite validation.
+      if (emailsToInvite.length > 0) {
+        classroom.invitedEmails.push(
+          ...emailsToInvite.map((email) => ({ email, status: "pending" }))
+        );
+      }
+
+      await classroom.save();
+
+      let inviteFailedCount = 0;
+      if (emailsToInvite.length > 0) {
+        const inviteResults = await Promise.allSettled(
+          emailsToInvite.map((email) =>
+            sendInviteEmail(email, classroom.roomCode, faculty.name, classroom.name)
+          )
+        );
+
+        inviteFailedCount = inviteResults.filter(
+          (result) => result.status === "rejected" || result.value === false
+        ).length;
+      }
+
+      const inviteSentCount = Math.max(0, emailsToInvite.length - inviteFailedCount);
+
+      res.json({
+        success: true,
+        message:
+          inviteSentCount > 0
+            ? `Classroom updated successfully. ${inviteSentCount} invitation(s) sent.`
+            : "Classroom updated successfully",
+        inviteSummary: {
+          requested: requestedEmails.length,
+          sent: inviteSentCount,
+          failed: inviteFailedCount,
+          skipped: requestedEmails.length - emailsToInvite.length,
+        },
+        classroom,
+      });
+    } catch (error) {
+      console.error("Error updating classroom:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update classroom",
+      });
+    }
+  }
+);
+
+// Delete classroom
+router.delete(
+  "/classrooms/:classroomId",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { classroomId } = req.params;
+      const facultyId = req.user._id;
+
+      const classroom = await Classroom.findOneAndDelete({
+        _id: classroomId,
+        faculty: facultyId,
+      });
+
+      if (!classroom) {
+        return res.status(404).json({
+          success: false,
+          message: "Classroom not found or unauthorized",
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "Classroom deleted successfully",
+      });
+    } catch (error) {
+      console.error("Error deleting classroom:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete classroom",
+      });
+    }
+  }
+);
+
+// Remove student from classroom
+router.delete(
+  "/classrooms/:classroomId/students/:studentId",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { classroomId, studentId } = req.params;
+      const facultyId = req.user._id;
+
+      const classroom = await Classroom.findOne({
+        _id: classroomId,
+        faculty: facultyId,
+      });
+
+      if (!classroom) {
+        return res.status(404).json({
+          success: false,
+          message: "Classroom not found or unauthorized",
+        });
+      }
+
+      classroom.students = classroom.students.filter(
+        (student) => student.toString() !== studentId
+      );
+
+      await classroom.save();
+
+      res.json({
+        success: true,
+        message: "Student removed successfully",
+      });
+    } catch (error) {
+      console.error("Error removing student:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to remove student",
+      });
+    }
+  }
+);
+
+// Get classroom details with students
+router.get(
+  "/classrooms/:classroomId",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { classroomId } = req.params;
+      const facultyId = req.user._id;
+
+      const classroom = await Classroom.findOne({
+        _id: classroomId,
+        faculty: facultyId,
+      }).populate("students", "name email");
+
+      if (!classroom) {
+        return res.status(404).json({
+          success: false,
+          message: "Classroom not found or unauthorized",
+        });
+      }
+
+      res.json({
+        success: true,
+        classroom,
+      });
+    } catch (error) {
+      console.error("Error fetching classroom details:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch classroom details",
+      });
+    }
+  }
+);
+
+// Configure multer for file upload
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, "uploads/assignments/"); // Make sure this directory exists
+  },
+  filename: function (req, file, cb) {
+    cb(null, Date.now() + "-" + file.originalname);
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === "application/pdf") {
+      cb(null, true);
+    } else {
+      cb(new Error("Only PDF files are allowed"));
+    }
+  },
+});
+
+// File upload route
+router.post(
+  "/upload",
+  authMiddleware("Faculty"),
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "No file uploaded",
+        });
+      }
+
+      const fileUrl = `/uploads/assignments/${req.file.filename}`;
+
+      res.json({
+        success: true,
+        fileUrl,
+        message: "File uploaded successfully",
+      });
+    } catch (error) {
+      console.error("File upload error:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to upload file",
+      });
+    }
+  }
+);
+
+// Create assignment route
+router.post(
+  "/classrooms/:classroomId/assignments",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { classroomId } = req.params;
+      const { title, description, dueDate, maxMarks, assignmentFile } =
+        req.body;
+      const facultyId = req.user._id;
+
+      if (!title || !description || !dueDate || !maxMarks) {
+        return res.status(400).json({
+          success: false,
+          message: "Title, description, due date, and max marks are required",
+        });
+      }
+
+      const classroom = await Classroom.findOne({
+        _id: classroomId,
+        faculty: facultyId,
+      });
+
+      if (!classroom) {
+        return res.status(404).json({
+          success: false,
+          message: "Classroom not found or unauthorized",
+        });
+      }
+
+      let idealAnswers = {
+        questions: [
+          {
+            questionNumber: 1,
+            idealAnswer: String(description).slice(0, 400),
+            keyPoints: ["Understand assignment requirements"],
+            maxMarks: Number(maxMarks),
+            markingCriteria: ["Relevance", "Completeness", "Clarity"],
+          },
+        ],
+        totalMarks: Number(maxMarks),
+      };
+
+      // Generate ideal answers from uploaded PDF only when a file is provided.
+      if (assignmentFile && typeof assignmentFile === "string") {
+        const relativeFilePath = assignmentFile.replace(/^\/+/, "");
+        const assignmentFilePath = path.join(process.cwd(), relativeFilePath);
+
+        if (fs.existsSync(assignmentFilePath)) {
+          const assignmentText = await extractPDFText(assignmentFilePath);
+
+          // Generate ideal answers using optimized prompt for speed and reliability
+          const prompt = `Assignment: ${title}
+Content: ${assignmentText.substring(0, 800)}
+Max Marks: ${maxMarks}
+
+Create answer key in this exact JSON format:
+{
+  "questions": [
+    {
+      "questionNumber": 1,
+      "idealAnswer": "brief answer",
+      "keyPoints": ["point1", "point2"],
+      "maxMarks": ${maxMarks},
+      "markingCriteria": ["criteria1", "criteria2"]
+    }
+  ],
+  "totalMarks": ${maxMarks}
+}`;
+
+          const idealAnswersResponse = await withTimeout(
+            model.generateContent(prompt),
+            10000 // 10 second timeout for ideal answers - faster
+          );
+
+          // Parse and validate the response
+          let responseContent = ""; // Declare outside try block for error logging
+          try {
+            responseContent = idealAnswersResponse.response.text().trim();
+
+            // Extract JSON from markdown code blocks if present
+            let jsonContent = responseContent;
+
+            // Check if response starts with ```json and ends with ```
+            if (
+              responseContent.startsWith("```json") &&
+              responseContent.endsWith("```")
+            ) {
+              // Find the start of JSON content (after ```json)
+              const startIndex = responseContent.indexOf("```json") + 7; // 7 is length of '```json'
+              // Find the last occurrence of ``` (end of the JSON block)
+              const endIndex = responseContent.lastIndexOf("```");
+
+              if (startIndex < endIndex) {
+                jsonContent = responseContent
+                  .substring(startIndex, endIndex)
+                  .trim();
+              }
+            } else if (
+              responseContent.startsWith("```") &&
+              responseContent.endsWith("```")
+            ) {
+              // Handle generic code blocks
+              const startIndex = responseContent.indexOf("```") + 3;
+              // Skip any language identifier on the first line
+              const firstNewline = responseContent.indexOf("\n", startIndex);
+              const actualStart =
+                firstNewline !== -1 ? firstNewline + 1 : startIndex;
+              const endIndex = responseContent.lastIndexOf("```");
+
+              if (actualStart < endIndex) {
+                jsonContent = responseContent
+                  .substring(actualStart, endIndex)
+                  .trim();
+              }
+            }
+
+            // Try to parse the JSON directly
+            try {
+              idealAnswers = JSON.parse(jsonContent);
+            } catch (parseError) {
+              // If direct parsing fails, try to find the JSON object boundaries
+              const openBrace = jsonContent.indexOf("{");
+              const closeBrace = jsonContent.lastIndexOf("}");
+
+              if (
+                openBrace !== -1 &&
+                closeBrace !== -1 &&
+                openBrace < closeBrace
+              ) {
+                const extractedJson = jsonContent.substring(
+                  openBrace,
+                  closeBrace + 1
+                );
+                idealAnswers = JSON.parse(extractedJson);
+              } else {
+                throw new Error("No valid JSON found in response");
+              }
+            }
+
+            // Validate the structure
+            if (
+              !idealAnswers.questions ||
+              !Array.isArray(idealAnswers.questions)
+            ) {
+              throw new Error("Invalid response structure");
+            }
+          } catch (parseError) {
+            console.error("AI response parsing error:", parseError);
+            console.error("Raw response content:", responseContent);
+            // Keep fallback ideal answers instead of failing the request.
+          }
+        } else {
+          console.warn("Assignment file not found on disk:", assignmentFilePath);
+        }
+      }
+
+      // Create and save the assignment
+      const assignment = new Assignment({
+        title,
+        description,
+        dueDate,
+        maxMarks: Number(maxMarks),
+        assignmentFile,
+        classroom: classroomId,
+        createdBy: facultyId,
+        idealAnswers,
+      });
+
+      await assignment.save();
+
+      // Update classroom with new assignment using $push
+      await Classroom.updateOne(
+        { _id: classroomId },
+        {
+          $push: { assignments: assignment._id },
+        }
+      );
+
+      // After successfully creating the assignment, notify students
+      const classroomWithStudents = await Classroom.findById(
+        classroomId
+      ).populate("students", "email name");
+
+      // Send notifications to students
+      for (const student of classroomWithStudents.students) {
+        try {
+          await notifyNewAssignment(
+            student.email,
+            student.name,
+            assignment.title,
+            assignment.dueDate,
+            classroomWithStudents.name // Use classroomWithStudents instead of classroom
+          );
+        } catch (error) {
+          console.error(
+            `Failed to send notification to ${student.email}:`,
+            error
+          );
+        }
+      }
+
+      res.json({
+        success: true,
+        message: "Assignment created and notifications sent",
+        assignment,
+      });
+    } catch (error) {
+      console.error("Error creating assignment:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to create assignment",
+      });
+    }
+  }
+);
+
+// Get classroom assignments
+router.get(
+  "/classrooms/:classroomId/assignments",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { classroomId } = req.params;
+      const facultyId = req.user._id;
+
+      // Verify classroom belongs to faculty
+      const classroom = await Classroom.findOne({
+        _id: classroomId,
+        faculty: facultyId,
+      });
+
+      if (!classroom) {
+        return res.status(404).json({
+          success: false,
+          message: "Classroom not found or unauthorized",
+        });
+      }
+
+      const assignments = await Assignment.find({
+        classroom: classroomId,
+      }).populate("submissions.student", "name email");
+
+      res.json({
+        success: true,
+        assignments,
+      });
+    } catch (error) {
+      console.error("Error fetching assignments:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch assignments",
+      });
+    }
+  }
+);
+
+// Grade submission route
+router.post(
+  "/assignments/:assignmentId/submissions/:submissionId/grade",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { assignmentId, submissionId } = req.params;
+      const { grade, feedback } = req.body;
+
+      // Find assignment and populate classroom details
+      const assignment = await Assignment.findById(assignmentId).populate(
+        "classroom",
+        "name"
+      );
+
+      if (!assignment) {
+        return res.status(404).json({
+          success: false,
+          message: "Assignment not found",
+        });
+      }
+
+      // Find the submission
+      const submission = assignment.submissions.id(submissionId);
+      if (!submission) {
+        return res.status(404).json({
+          success: false,
+          message: "Submission not found",
+        });
+      }
+
+      // Validate grade
+      if (grade < 0 || grade > assignment.maxMarks) {
+        return res.status(400).json({
+          success: false,
+          message: `Grade must be between 0 and ${assignment.maxMarks}`,
+        });
+      }
+
+      // Get student details for email
+      const student = await User.findById(submission.student);
+      if (!student) {
+        return res.status(404).json({
+          success: false,
+          message: "Student not found",
+        });
+      }
+
+      // Update submission
+      submission.grade = grade;
+      submission.feedback = feedback;
+      await assignment.save();
+
+      // Send email notification
+      try {
+        await notifyGradePosted(
+          student.email,
+          student.name,
+          assignment.title,
+          grade,
+          assignment.maxMarks,
+          feedback,
+          assignment.classroom.name
+        );
+      } catch (emailError) {
+        console.error("Error sending grade notification:", emailError);
+        // Don't fail the grading if email fails
+      }
+
+      res.json({
+        success: true,
+        message: "Grade posted successfully",
+        submission: submission,
+      });
+    } catch (error) {
+      console.error("Grading error:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to post grade",
+      });
+    }
+  }
+);
+
+// Update grade route
+router.put(
+  "/assignments/:assignmentId/submissions/:submissionId/grade",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { assignmentId, submissionId } = req.params;
+      const { grade, feedback } = req.body;
+      const facultyId = req.user._id;
+
+      const assignment = await Assignment.findOne({
+        _id: assignmentId,
+        createdBy: facultyId,
+      })
+        .populate("submissions.student", "name email")
+        .populate("classroom", "name"); // Add this to get classroom name
+
+      if (!assignment) {
+        return res.status(404).json({
+          success: false,
+          message: "Assignment not found or unauthorized",
+        });
+      }
+
+      const submission = assignment.submissions.id(submissionId);
+      if (!submission) {
+        return res.status(404).json({
+          success: false,
+          message: "Submission not found",
+        });
+      }
+
+      submission.grade = grade;
+      submission.feedback = feedback;
+      await assignment.save();
+
+      // Send email notification
+      try {
+        await notifyGradePosted(
+          submission.student.email,
+          submission.student.name,
+          assignment.title,
+          grade,
+          assignment.maxMarks,
+          feedback,
+          assignment.classroom.name
+        );
+        console.log("Grade notification email sent successfully");
+      } catch (emailError) {
+        console.error("Error sending grade notification:", emailError);
+        // Don't fail the grading if email fails
+      }
+
+      res.json({
+        success: true,
+        message: "Grade updated successfully",
+        submission,
+      });
+    } catch (error) {
+      console.error("Error updating grade:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update grade",
+      });
+    }
+  }
+);
+
+// Delete assignment
+router.delete(
+  "/assignments/:assignmentId",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { assignmentId } = req.params;
+      const facultyId = req.user._id;
+
+      const assignment = await Assignment.findOne({
+        _id: assignmentId,
+        createdBy: facultyId,
+      });
+
+      if (!assignment) {
+        return res.status(404).json({
+          success: false,
+          message: "Assignment not found or unauthorized",
+        });
+      }
+
+      // Delete the assignment file if it exists
+      if (assignment.assignmentFile) {
+        const filePath = path.join(
+          __dirname,
+          "..",
+          "uploads",
+          assignment.assignmentFile.split("/").pop()
+        );
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      }
+
+      // Delete all submission files
+      for (const submission of assignment.submissions) {
+        if (submission.submissionUrl) {
+          const submissionPath = path.join(
+            __dirname,
+            "..",
+            "uploads",
+            submission.submissionUrl.split("/").pop()
+          );
+          if (fs.existsSync(submissionPath)) {
+            fs.unlinkSync(submissionPath);
+          }
+        }
+      }
+
+      await Assignment.deleteOne({ _id: assignmentId });
+
+      res.json({
+        success: true,
+        message: "Assignment deleted successfully",
+      });
+    } catch (error) {
+      console.error("Error deleting assignment:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete assignment",
+      });
+    }
+  }
+);
+
+// Update assignment
+router.put(
+  "/assignments/:assignmentId",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { assignmentId } = req.params;
+      const { title, description, dueDate, maxMarks, assignmentFile } =
+        req.body;
+      const facultyId = req.user._id;
+
+      const assignment = await Assignment.findOne({
+        _id: assignmentId,
+        createdBy: facultyId,
+      });
+
+      if (!assignment) {
+        return res.status(404).json({
+          success: false,
+          message: "Assignment not found or unauthorized",
+        });
+      }
+
+      // Update assignment details
+      assignment.title = title;
+      assignment.description = description;
+      assignment.dueDate = dueDate;
+      assignment.maxMarks = maxMarks;
+      if (assignmentFile) {
+        assignment.assignmentFile = assignmentFile;
+      }
+
+      await assignment.save();
+
+      // Send email notifications to all students
+      const classroom = await Classroom.findById(assignment.classroom).populate(
+        "students",
+        "email name"
+      );
+
+      for (const student of classroom.students) {
+        await notifyNewAssignment([student], assignment, classroom.name);
+      }
+
+      res.json({
+        success: true,
+        message: "Assignment updated successfully",
+        assignment,
+      });
+    } catch (error) {
+      console.error("Error updating assignment:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update assignment",
+      });
+    }
+  }
+);
+
+// Get assignment statistics
+router.get(
+  "/assignments/:assignmentId/statistics",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { assignmentId } = req.params;
+      const facultyId = req.user._id;
+
+      const assignment = await Assignment.findOne({
+        _id: assignmentId,
+        createdBy: facultyId,
+      }).populate("submissions.student", "name");
+
+      if (!assignment) {
+        return res.status(404).json({
+          success: false,
+          message: "Assignment not found or unauthorized",
+        });
+      }
+
+      const classroom = await Classroom.findById(assignment.classroom);
+      const totalStudents = classroom.students.length;
+      const totalSubmissions = assignment.submissions.length;
+      const gradedSubmissions = assignment.submissions.filter(
+        (sub) => sub.grade !== null
+      ).length;
+
+      // Calculate average grade
+      const grades = assignment.submissions
+        .filter((sub) => sub.grade !== null)
+        .map((sub) => sub.grade);
+      const averageGrade =
+        grades.length > 0
+          ? grades.reduce((a, b) => a + b, 0) / grades.length
+          : 0;
+
+      // Calculate grade distribution
+      const gradeDistribution = {
+        "90-100": 0,
+        "80-89": 0,
+        "70-79": 0,
+        "60-69": 0,
+        "Below 60": 0,
+      };
+
+      grades.forEach((grade) => {
+        const percentage = (grade / assignment.maxMarks) * 100;
+        if (percentage >= 90) gradeDistribution["90-100"]++;
+        else if (percentage >= 80) gradeDistribution["80-89"]++;
+        else if (percentage >= 70) gradeDistribution["70-79"]++;
+        else if (percentage >= 60) gradeDistribution["60-69"]++;
+        else gradeDistribution["Below 60"]++;
+      });
+
+      res.json({
+        success: true,
+        statistics: {
+          totalStudents,
+          totalSubmissions,
+          gradedSubmissions,
+          averageGrade,
+          gradeDistribution,
+          submissionRate: (totalSubmissions / totalStudents) * 100,
+          gradingProgress: (gradedSubmissions / totalSubmissions) * 100,
+        },
+      });
+    } catch (error) {
+      console.error("Error fetching assignment statistics:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch assignment statistics",
+      });
+    }
+  }
+);
+
+// Add assignment submission route
+router.post(
+  "/assignments/:assignmentId/submit",
+  authMiddleware("Student"),
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      const { assignmentId } = req.params;
+      const studentId = req.user._id;
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "No file uploaded",
+        });
+      }
+
+      const assignment = await Assignment.findById(assignmentId);
+      if (!assignment) {
+        return res.status(404).json({
+          success: false,
+          message: "Assignment not found",
+        });
+      }
+
+      // Check if submission is before due date
+      if (new Date() > new Date(assignment.dueDate)) {
+        return res.status(400).json({
+          success: false,
+          message: "Assignment submission deadline has passed",
+        });
+      }
+
+      const submissionFile = `/uploads/submissions/${req.file.filename}`;
+
+      // Update or create submission
+      const submissionIndex = assignment.submissions.findIndex(
+        (sub) => sub.student.toString() === studentId.toString()
+      );
+
+      if (submissionIndex > -1) {
+        assignment.submissions[submissionIndex].submissionFile = submissionFile;
+        assignment.submissions[submissionIndex].submittedAt = new Date();
+      } else {
+        assignment.submissions.push({
+          student: studentId,
+          submissionFile,
+          submittedAt: new Date(),
+        });
+      }
+
+      await assignment.save();
+
+      res.json({
+        success: true,
+        message: "Assignment submitted successfully",
+      });
+    } catch (error) {
+      console.error("Submission error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to submit assignment",
+      });
+    }
+  }
+);
+
+// Get assignments for student
+router.get(
+  "/student/assignments",
+  authMiddleware("Student"),
+  async (req, res) => {
+    try {
+      const studentId = req.user._id;
+
+      // Find all classrooms where the student is enrolled
+      const classrooms = await Classroom.find({
+        students: studentId,
+      });
+
+      // Get all assignments from these classrooms
+      const assignments = await Assignment.find({
+        classroom: { $in: classrooms.map((c) => c._id) },
+      })
+        .populate("classroom", "name")
+        .populate("createdBy", "name");
+
+      res.json({
+        success: true,
+        assignments,
+      });
+    } catch (error) {
+      console.error("Error fetching assignments:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch assignments",
+      });
+    }
+  }
+);
+
+// Auto-grade submission using Gemini API
+router.post(
+  "/assignments/:assignmentId/submissions/:submissionId/autograde",
+  authMiddleware("Faculty"),
+  async (req, res) => {
+    try {
+      const { assignmentId, submissionId } = req.params;
+      const assignment = await Assignment.findById(assignmentId)
+        .populate("submissions.student", "name")
+        .populate("classroom", "name");
+
+      if (!assignment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Assignment not found" });
+      }
+
+      const submission = assignment.submissions.id(submissionId);
+      if (!submission) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Submission not found" });
+      }
+
+      // Fix file path handling
+      const submissionFileName = submission.submissionUrl
+        ? submission.submissionUrl.split("/").pop()
+        : null;
+
+      if (!submissionFileName) {
+        return res.status(404).json({
+          success: false,
+          message: "No submission file found",
+        });
+      }
+
+      const submissionFilePath = path.join(
+        __dirname,
+        "..",
+        "uploads",
+        "submissions",
+        submissionFileName
+      );
+
+      if (!fs.existsSync(submissionFilePath)) {
+        console.error("File not found:", {
+          path: submissionFilePath,
+          submissionUrl: submission.submissionUrl,
+        });
+        return res.status(404).json({
+          success: false,
+          message: "Submission file not found on server",
+        });
+      }
+
+      try {
+        const dataBuffer = fs.readFileSync(submissionFilePath);
+        // Read PDF content using pdf2json
+        const pdfParser = new PDFParser();
+        const pdfContent = await new Promise((resolve, reject) => {
+          pdfParser.on("pdfParser_dataReady", (pdfData) => {
+            const text = pdfData.Pages.map((page) =>
+              page.Texts.map((text) => decodeURIComponent(text.R[0].T)).join(
+                " "
+              )
+            ).join("\n");
+            resolve(text);
+          });
+          pdfParser.on("pdfParser_dataError", reject);
+          pdfParser.loadPDF(submissionFilePath);
+        });
+
+        // Extract text from student's submission
+        const submissionText = await extractPDFText(submissionFilePath);
+
+        // Get ideal answers from assignment
+        const idealAnswers = assignment.idealAnswers;
+
+        // Compare with ideal answers using optimized prompt for speed and reliability
+        const gradingPrompt = `Grade this submission out of ${
+          assignment.maxMarks
+        } marks:
+
+Ideal Answer: ${JSON.stringify(idealAnswers).substring(0, 600)}
+
+Student Submission: ${submissionText.substring(0, 800)}
+
+Respond in JSON format:
+{"grade": number, "feedback": "brief feedback"}`;
+
+        const gradingResponse = await withTimeout(
+          model.generateContent(gradingPrompt),
+          8000 // 8 second timeout for grading - faster
+        );
+
+        // Parse the AI response with error handling
+        try {
+          const responseContent = gradingResponse.response.text().trim();
+
+          // Extract JSON from markdown code blocks if present
+          let jsonContent = responseContent;
+
+          // Check if response starts with ```json and ends with ```
+          if (
+            responseContent.startsWith("```json") &&
+            responseContent.endsWith("```")
+          ) {
+            // Find the start of JSON content (after ```json)
+            const startIndex = responseContent.indexOf("```json") + 7; // 7 is length of '```json'
+            // Find the last occurrence of ``` (end of the JSON block)
+            const endIndex = responseContent.lastIndexOf("```");
+
+            if (startIndex < endIndex) {
+              jsonContent = responseContent
+                .substring(startIndex, endIndex)
+                .trim();
+            }
+          } else if (
+            responseContent.startsWith("```") &&
+            responseContent.endsWith("```")
+          ) {
+            // Handle generic code blocks
+            const startIndex = responseContent.indexOf("```") + 3;
+            // Skip any language identifier on the first line
+            const firstNewline = responseContent.indexOf("\n", startIndex);
+            const actualStart =
+              firstNewline !== -1 ? firstNewline + 1 : startIndex;
+            const endIndex = responseContent.lastIndexOf("```");
+
+            if (actualStart < endIndex) {
+              jsonContent = responseContent
+                .substring(actualStart, endIndex)
+                .trim();
+            }
+          }
+
+          let aiResponse;
+          try {
+            aiResponse = JSON.parse(jsonContent);
+          } catch (parseError) {
+            // If direct parsing fails, try to find the JSON object boundaries
+            const openBrace = jsonContent.indexOf("{");
+            const closeBrace = jsonContent.lastIndexOf("}");
+
+            if (
+              openBrace !== -1 &&
+              closeBrace !== -1 &&
+              openBrace < closeBrace
+            ) {
+              const extractedJson = jsonContent.substring(
+                openBrace,
+                closeBrace + 1
+              );
+              aiResponse = JSON.parse(extractedJson);
+            } else {
+              throw new Error("Could not parse API response as JSON");
+            }
+          }
+
+          // Validate the response format
+          if (
+            !aiResponse ||
+            typeof aiResponse.grade === "undefined" ||
+            !aiResponse.feedback
+          ) {
+            throw new Error("Invalid response format from API");
+          }
+
+          // Calculate proportional grade
+          const finalGrade = Math.min(
+            Math.max(0, parseFloat(aiResponse.grade)),
+            assignment.maxMarks
+          );
+
+          // Update submission
+          submission.grade = finalGrade;
+          submission.feedback = aiResponse.feedback;
+          submission.isAutoGraded = true;
+          await assignment.save();
+
+          // Send the converted grade to frontend
+          res.json({
+            success: true,
+            message: "Assignment auto-graded successfully",
+            grade: finalGrade,
+            feedback: aiResponse.feedback,
+          });
+        } catch (parseError) {
+          console.error("Error parsing API response:", parseError);
+          res.status(500).json({
+            success: false,
+            message: "Failed to parse auto-grading response",
+          });
+        }
+      } catch (error) {
+        console.error("File reading error:", error);
+        return res.status(500).json({
+          success: false,
+          message: "Error reading submission file",
+        });
+      }
+    } catch (error) {
+      console.error("Auto-grading error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to auto-grade assignment",
+      });
+    }
+  }
+);
+
+export default router;
