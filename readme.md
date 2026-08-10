@@ -11,7 +11,7 @@ Coming soon
 
 # TLDR
 
-SmartAssign is a production-ready applied AI system designed to reduce assignment feedback latency at scale. It uses LLMs and retrieval-based reasoning to assist educators in grading and feedback workflows while keeping humans in the loop to ensure reliability, transparency, and academic integrity.
+AssigPro is a production-ready applied AI system designed to reduce assignment feedback latency at scale. It uses LLMs and retrieval-based reasoning to assist educators in grading and feedback workflows while keeping humans in the loop to ensure reliability, transparency, and academic integrity.
 
 
 # 🎯 Problem Statement
