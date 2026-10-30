@@ -1,5 +1,7 @@
-const BASE_URL = process.env.NODE_ENV === 'production' ? 'https://ai-based-evaluation-platform.onrender.com'  // Remove any trailing slash ? process.env.REACT_APP_BASE_URL
-: 'http://localhost:8080';
+const isProduction = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.PROD : false;
+const BASE_URL = isProduction 
+    ? 'https://ai-based-evaluation-platform.onrender.com' 
+    : 'http://localhost:8080';
 
 const API_BASE_URL = `${BASE_URL}/api`;
 

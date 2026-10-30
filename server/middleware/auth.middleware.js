@@ -27,11 +27,16 @@ const authMiddleware = (requiredRole) => async (req,res,next) => {
         }
 
         // Check if role matches if a specific role is required
-        if (requiredRole && user.role !== requiredRole) {
-            return res.status(403).json({
-                success: false,
-                message: 'Unauthorized access'
-            });
+        if (requiredRole) {
+            const hasRole = Array.isArray(requiredRole)
+                ? requiredRole.includes(user.role)
+                : user.role === requiredRole;
+            if (!hasRole) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Unauthorized access'
+                });
+            }
         }
 
         req.user = {

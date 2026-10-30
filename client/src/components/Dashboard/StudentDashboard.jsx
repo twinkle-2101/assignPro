@@ -8,12 +8,14 @@ import Notification from '../Notification.jsx';
 import StudentAssignmentView from '../Assignment/StudentAssignmentView.jsx';
 import AssignmentSubmissionModal from '../Assignment/AssignmentSubmissionModal.jsx';
 import JoinClassroomModal from '../Classroom/JoinClassroomModal.jsx';
+import StudentProgressTracker from './StudentProgressTracker.jsx';
 import Header from '../header/Header.jsx';
 import { useUpdate } from '../../context/UpdateContext.jsx';
 import { getApiUrl, getBaseUrl } from '../../config/api.config.js';
 import './StudentDashboard.css';
 
 const StudentDashboard = () => {
+    const [currentView, setCurrentView] = useState('classrooms'); // 'classrooms' | 'progress'
     const [enrolledClassrooms, setEnrolledClassrooms] = useState([]);
     const [selectedClassroom, setSelectedClassroom] = useState(null);
     const [assignments, setAssignments] = useState([]);
@@ -463,7 +465,67 @@ const StudentDashboard = () => {
     </div>
 </div>
 
-                    {!selectedClassroom ? (
+                    {/* Navigation Tabs */}
+                    <div className="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                        <div className="btn-group p-1 bg-white rounded-3 shadow-sm border" role="group">
+                            <button
+                                type="button"
+                                className={`btn btn-sm px-4 py-2 rounded-2 fw-semibold transition-all ${
+                                    currentView === 'classrooms' 
+                                        ? 'btn-primary text-white shadow-sm' 
+                                        : 'btn-light text-secondary border-0'
+                                }`}
+                                onClick={() => {
+                                    setCurrentView('classrooms');
+                                }}
+                            >
+                                <i className="fas fa-th-large me-2"></i>
+                                My Classrooms ({enrolledClassrooms.length})
+                            </button>
+                            <button
+                                type="button"
+                                className={`btn btn-sm px-4 py-2 rounded-2 fw-semibold transition-all ${
+                                    currentView === 'progress' 
+                                        ? 'btn-primary text-white shadow-sm' 
+                                        : 'btn-light text-secondary border-0'
+                                }`}
+                                onClick={() => {
+                                    setCurrentView('progress');
+                                    setSelectedClassroom(null);
+                                }}
+                            >
+                                <i className="fas fa-chart-line me-2 text-warning"></i>
+                                Progress Tracker
+                                <span className="badge bg-success ms-2 font-monospace">Live</span>
+                            </button>
+                        </div>
+
+                        {selectedClassroom && currentView === 'classrooms' && (
+                            <button
+                                className="btn btn-outline-secondary btn-sm px-3 py-2 rounded-3 bg-white shadow-sm"
+                                onClick={() => setSelectedClassroom(null)}
+                            >
+                                <i className="fas fa-arrow-left me-1"></i> Back to All Classrooms
+                            </button>
+                        )}
+                    </div>
+
+                    {currentView === 'progress' ? (
+                        <StudentProgressTracker
+                            onOpenSubmission={(assignment) => {
+                                setSelectedAssignment(assignment);
+                                setShowSubmissionModal(true);
+                            }}
+                            onSelectClassroom={(classroomId) => {
+                                const found = enrolledClassrooms.find(c => c._id === classroomId);
+                                if (found) {
+                                    setSelectedClassroom(found);
+                                    fetchAssignments(found._id);
+                                    setCurrentView('classrooms');
+                                }
+                            }}
+                        />
+                    ) : !selectedClassroom ? (
                         <div className="classrooms-grid">
                             {enrolledClassrooms.map((classroom, index) => (
                                 <div 
@@ -688,19 +750,23 @@ const StudentDashboard = () => {
       </div>
     </div>
 
-    <div className="toggle-buttons">
+    <div className="toggle-buttons d-flex gap-2">
       <button
-        className="btn btn-color"
-        style={{
-          width: '100%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: '0.5rem'
-        }}
+        className="btn btn-outline-secondary btn-sm"
+        onClick={() => setSelectedClassroom(null)}
+        title="Back to all enrolled classrooms"
       >
-        <i className="fas fa-tasks me-2"></i>
-        Assignments
+        <i className="fas fa-arrow-left me-1"></i> Classrooms
+      </button>
+      <button
+        className="btn btn-outline-primary btn-sm"
+        onClick={() => {
+          setCurrentView('progress');
+          setSelectedClassroom(null);
+        }}
+        title="View comprehensive analytics"
+      >
+        <i className="fas fa-chart-line me-1"></i> Progress Tracker
       </button>
     </div>
   </div>

@@ -2,6 +2,7 @@ import express from "express"
 const router = express.Router();
 import Classroom from "../models/classroom.js";
 import User from "../models/user.js";
+import Announcement from "../models/announcement.js";
 import authMiddleware from "../middleware/auth.middleware.js";
 import { sendInviteEmail } from "../utils/emailService.js"
 import crypto from "crypto"
@@ -106,24 +107,24 @@ router.post('/create', authMiddleware('Faculty'), async (req, res) => {
         const faculty = req.user;
         const roomCode = generateRoomCode();
         
+        const emailsList = Array.isArray(studentEmails) ? studentEmails : [];
         const classroom = new Classroom({
             name,
             subject,
             description,
             faculty: faculty._id,
             roomCode,
-            invitedEmails: studentEmails.map(email => ({ email, status: 'pending' }))
+            invitedEmails: emailsList.map(email => ({ email: email.trim().toLowerCase(), status: 'pending' }))
         });
 
         await classroom.save();
 
         // Send invites to all students
-        for (const email of studentEmails) {
+        for (const email of emailsList) {
             try {
                 await sendInviteEmail(email, roomCode, faculty.name, name);
             } catch (emailError) {
                 console.error('Error sending invite email:', emailError);
-                // Continue with other emails even if one fails
             }
         }
 

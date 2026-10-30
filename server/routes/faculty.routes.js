@@ -7,7 +7,7 @@ import Assignment from "../models/assignment.js";
 import path from "path"
 import fs from "fs"
 import nodemailer from "nodemailer";
-import { sendInviteEmail, notifyNewAssignment, notifyGradePosted} from "../utils/emailService.js";
+import { sendInviteEmail, notifyNewAssignment, notifyAssignmentUpdated, notifyGradePosted } from "../utils/emailService.js";
 import multer from "multer";
 import PDFParser from "pdf2json";
 import { GoogleGenerativeAI } from "@google/generative-ai";
@@ -47,8 +47,7 @@ const model = genAI.getGenerativeModel({
   ],
 });
 
-const result = await model.generateContent("Hello");
-console.log(result.response.text());
+// Gemini model ready for inference
 
 // Create a timeout wrapper for API calls with aggressive timeouts for speed
 const withTimeout = (promise, timeoutMs = 15000) => {
@@ -126,12 +125,27 @@ router.post("/classrooms", authMiddleware("Faculty"), async (req, res) => {
     // Generate a unique room code
     const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
 
+    const normalizedStudentEmails = Array.isArray(studentEmails)
+      ? studentEmails
+      : typeof studentEmails === "string"
+      ? studentEmails.split(",")
+      : [];
+
+    const uniqueEmails = [
+      ...new Set(
+        normalizedStudentEmails
+          .map((e) => String(e || "").trim().toLowerCase())
+          .filter(Boolean)
+      ),
+    ];
+
     const newClassroom = new Classroom({
       name,
       subject,
       description,
       faculty: facultyId,
       roomCode,
+      invitedEmails: uniqueEmails.map((email) => ({ email, status: "pending" })),
     });
 
     await newClassroom.save();
@@ -191,7 +205,7 @@ router.put(
       classroom.name = name || classroom.name;
       classroom.subject = subject || classroom.subject;
       classroom.description = description || classroom.description;
-c  
+
       // Normalize incoming email list from either array or comma-separated string.
       const normalizedEmails = Array.isArray(studentEmails)
         ? studentEmails
@@ -955,8 +969,22 @@ router.put(
         "email name"
       );
 
-      for (const student of classroom.students) {
-        await notifyNewAssignment([student], assignment, classroom.name);
+      if (classroom?.students && Array.isArray(classroom.students)) {
+        for (const student of classroom.students) {
+          if (student?.email) {
+            try {
+              await notifyAssignmentUpdated(
+                student.email,
+                student.name || "Student",
+                assignment.title,
+                assignment.dueDate,
+                classroom.name
+              );
+            } catch (err) {
+              console.error(`Failed to notify ${student.email}:`, err);
+            }
+          }
+        }
       }
 
       res.json({
